@@ -18,6 +18,8 @@ Enhanced:
  - Robust minting with retries and fallback logging.
  - Automatic keep‑alive ping to prevent Render from sleeping.
  - Top‑notch crypto vault landing page.
+ - Lifespan events (no deprecation warnings).
+ - Test‑mint returns raw response for easy debugging.
 """
 import os
 import json
@@ -27,7 +29,7 @@ import secrets
 import base64
 import logging
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
@@ -131,9 +133,16 @@ def init_db():
 init_db()
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# FastAPI app with lifespan
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Tripwire Console", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    asyncio.create_task(keep_alive())
+    yield
+    # Shutdown (nothing to clean up)
+
+app = FastAPI(title="Tripwire Console", docs_url=None, redoc_url=None, lifespan=lifespan)
 security = HTTPBasic()
 
 # ---------------------------------------------------------------------------
@@ -1436,23 +1445,51 @@ async def keep_alive():
             log.warning("Keep‑alive ping failed: %s", e)
         await asyncio.sleep(240)  # 4 minutes
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(keep_alive())
-
 # ---------------------------------------------------------------------------
 # Admin / test endpoints
 # ---------------------------------------------------------------------------
 @app.get("/admin/test-mint")
 async def test_mint(auth: bool = Depends(check_auth)):
     hid = secrets.token_hex(8)
-    result = await mint_canary(hid, "manual_test")
-    if not result:
+    memo = f"tripwire:manual_test:{hid[:8]}"
+    payload = {"type": "aws_keys", "memo": memo}
+    if BASE_URL:
+        payload["webhook_url"] = f"{BASE_URL}/webhook/canarytoken"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(CANARYTOKENS_GENERATE_URL, data=payload)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
         return JSONResponse(
-            {"ok": False, "error": "Mint failed or unexpected response shape — check service logs for the raw body."},
+            {"ok": False, "error": f"Request failed: {str(e)}", "raw": None},
             status_code=502,
         )
-    return {"ok": True, "result": result}
+
+    access_key_id = data.get("access_key_id")
+    secret_access_key = data.get("secret_access_key")
+    token_code = data.get("canarytoken") or data.get("token")
+
+    if not access_key_id or not secret_access_key:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Unexpected response shape – missing access_key_id or secret_access_key",
+                "raw_response": data,
+            },
+            status_code=502,
+        )
+
+    return {
+        "ok": True,
+        "result": {
+            "token_code": token_code,
+            "access_key_id": access_key_id,
+            "secret_access_key": secret_access_key,
+            "memo": memo,
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Main entry point

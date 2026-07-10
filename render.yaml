@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: tripwire-console
+    runtime: python
+    plan: starter          # persistent disks require Starter or higher — Free plan can't mount one
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    disk:
+      name: tripwire-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DB_PATH
+        value: /var/data/tripwire.db
+      - key: BASE_URL
+        sync: false        # set this AFTER first deploy, once you have the *.onrender.com URL
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DASHBOARD_USER
+        value: admin
+      - key: DASHBOARD_PASS
+        sync: false
+      - key: MINT_DEDUPE_HOURS
+        value: "24"

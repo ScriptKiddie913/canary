@@ -40,7 +40,7 @@ import base64
 import logging
 import asyncio
 import re
-from contextlib import asynccontextmanager
+from contextlib import contextmanager, asynccontextmanager   # <-- FIXED: added contextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import parse_qs

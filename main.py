@@ -1,5 +1,5 @@
 """
-TRIPWIRE — per‑visitor AWS canary honeypot
+TRIPWIRE — per‑visitor AWS canary honeypot (ENHANCED)
 --------------------------------------------------------------------
 Single‑file FastAPI service. Serves fake credential files (.env,
 kubeconfig, cloud‑keys.json). Every distinct visitor who pulls a trap
@@ -14,7 +14,16 @@ Persistence: SQLite on a Render persistent disk (single instance only —
 do not scale this service horizontally without moving to Postgres,
 since SQLite on a disk is not shared across instances).
 
-Enhanced:
+ENHANCED:
+ - Captures EVERYTHING about the visitor:
+   - Full request headers
+   - User‑Agent parsed for device, OS, browser, platform
+   - Sec‑CH‑UA (Client Hints) for modern browsers
+   - Basic Auth username (if present)
+   - Referer, Accept‑Language, Query String, Request Method/Path
+   - X‑Forwarded‑For (real IP)
+ - Stores all captured data in separate columns for easy querying
+ - Console dashboard displays device info
  - Robust minting with retries and fallback logging.
  - Automatic keep‑alive ping to prevent Render from sleeping.
  - Top‑notch crypto vault landing page.
@@ -22,6 +31,7 @@ Enhanced:
  - Test‑mint returns raw response for easy debugging.
 """
 import os
+import sys
 import json
 import time
 import hashlib
@@ -29,14 +39,24 @@ import secrets
 import base64
 import logging
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+# Attempt to import UA parser; fallback to a simple regex if unavailable
+try:
+    from ua_parser import user_agent_parser
+    HAS_UA_PARSER = True
+except ImportError:
+    HAS_UA_PARSER = False
+    logging.warning("ua_parser not installed; using fallback user-agent parsing.")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tripwire")
@@ -101,6 +121,7 @@ def db():
 
 def init_db():
     with db() as conn:
+        # Main harvests table – now with extended columns
         conn.execute("""
         CREATE TABLE IF NOT EXISTS harvests (
             id TEXT PRIMARY KEY,
@@ -114,7 +135,25 @@ def init_db():
             secret_access_key TEXT,
             memo TEXT,
             triggered INTEGER DEFAULT 0,
-            harvest_geo TEXT
+            harvest_geo TEXT,
+
+            -- NEW ENHANCED FIELDS
+            request_method TEXT,
+            request_path TEXT,
+            query_string TEXT,
+            referer TEXT,
+            accept_language TEXT,
+            auth_username TEXT,
+            device_info_json TEXT,          -- full parsed UA + client hints
+            device_type TEXT,
+            os_family TEXT,
+            os_version TEXT,
+            browser_family TEXT,
+            browser_version TEXT,
+            platform TEXT,
+            sec_ch_ua TEXT,
+            sec_ch_ua_platform TEXT,
+            sec_ch_ua_mobile TEXT
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS triggers (
@@ -129,6 +168,44 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_h_ip_trap ON harvests(visitor_ip, trap_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_h_token ON harvests(canary_token_code)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_t_harvest ON triggers(harvest_id)")
+        # Additional indexes for new columns
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_h_device_type ON harvests(device_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_h_os_family ON harvests(os_family)")
+
+    # Ensure new columns exist (migration)
+    migrate_schema()
+
+def migrate_schema():
+    """Add new columns if they don't exist (idempotent)."""
+    new_columns = [
+        ("request_method", "TEXT"),
+        ("request_path", "TEXT"),
+        ("query_string", "TEXT"),
+        ("referer", "TEXT"),
+        ("accept_language", "TEXT"),
+        ("auth_username", "TEXT"),
+        ("device_info_json", "TEXT"),
+        ("device_type", "TEXT"),
+        ("os_family", "TEXT"),
+        ("os_version", "TEXT"),
+        ("browser_family", "TEXT"),
+        ("browser_version", "TEXT"),
+        ("platform", "TEXT"),
+        ("sec_ch_ua", "TEXT"),
+        ("sec_ch_ua_platform", "TEXT"),
+        ("sec_ch_ua_mobile", "TEXT"),
+    ]
+    with db() as conn:
+        # Get existing columns
+        cur = conn.execute("PRAGMA table_info(harvests)")
+        existing = {row["name"] for row in cur.fetchall()}
+        for col, coltype in new_columns:
+            if col not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE harvests ADD COLUMN {col} {coltype}")
+                    log.info("Added column %s to harvests", col)
+                except sqlite3.OperationalError as e:
+                    log.warning("Could not add column %s: %s", col, e)
 
 init_db()
 
@@ -146,7 +223,7 @@ app = FastAPI(title="Tripwire Console", docs_url=None, redoc_url=None, lifespan=
 security = HTTPBasic()
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers: IP, geo, Telegram, etc.
 # ---------------------------------------------------------------------------
 def get_client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
@@ -190,6 +267,129 @@ async def notify_telegram(text: str):
     except Exception as e:
         log.warning("Telegram send exception: %s", e)
 
+# ---------------------------------------------------------------------------
+# Device / request info extraction – captures everything
+# ---------------------------------------------------------------------------
+def extract_auth_username(request: Request) -> Optional[str]:
+    """Extract username from Basic Auth header (if present)."""
+    auth = request.headers.get("authorization")
+    if not auth or not auth.startswith("Basic "):
+        return None
+    try:
+        b64 = auth[6:]  # after "Basic "
+        decoded = base64.b64decode(b64).decode("utf-8")
+        username, _, _ = decoded.partition(":")
+        return username
+    except Exception:
+        return None
+
+def parse_user_agent(ua: str) -> Dict[str, Any]:
+    """Parse user-agent using ua_parser if available, else fallback regex."""
+    if not ua:
+        return {
+            "device_type": "unknown",
+            "os_family": "unknown",
+            "os_version": "unknown",
+            "browser_family": "unknown",
+            "browser_version": "unknown",
+            "platform": "unknown"
+        }
+
+    if HAS_UA_PARSER:
+        parsed = user_agent_parser.Parse(ua)
+        device = parsed.get("device", {})
+        os = parsed.get("os", {})
+        browser = parsed.get("user_agent", {})
+        return {
+            "device_type": device.get("family", "unknown"),
+            "os_family": os.get("family", "unknown"),
+            "os_version": os.get("major", "") if os.get("major") else "",
+            "browser_family": browser.get("family", "unknown"),
+            "browser_version": browser.get("major", "") if browser.get("major") else "",
+            "platform": device.get("brand", "unknown"),
+        }
+    else:
+        # Simple fallback regex (lightweight)
+        res = {
+            "device_type": "unknown",
+            "os_family": "unknown",
+            "os_version": "unknown",
+            "browser_family": "unknown",
+            "browser_version": "unknown",
+            "platform": "unknown"
+        }
+        # Very basic: detect OS
+        ua_lower = ua.lower()
+        if "windows nt 10.0" in ua_lower:
+            res["os_family"] = "Windows 10"
+        elif "windows nt 6.3" in ua_lower:
+            res["os_family"] = "Windows 8.1"
+        elif "windows nt 6.2" in ua_lower:
+            res["os_family"] = "Windows 8"
+        elif "windows nt 6.1" in ua_lower:
+            res["os_family"] = "Windows 7"
+        elif "mac os x" in ua_lower:
+            res["os_family"] = "macOS"
+        elif "linux" in ua_lower:
+            res["os_family"] = "Linux"
+        elif "android" in ua_lower:
+            res["os_family"] = "Android"
+        elif "iphone" in ua_lower or "ipad" in ua_lower:
+            res["os_family"] = "iOS"
+        # Browser detection
+        if "firefox" in ua_lower:
+            res["browser_family"] = "Firefox"
+        elif "chrome" in ua_lower and not "edg" in ua_lower:
+            res["browser_family"] = "Chrome"
+        elif "safari" in ua_lower and not "chrome" in ua_lower:
+            res["browser_family"] = "Safari"
+        elif "edge" in ua_lower or "edg" in ua_lower:
+            res["browser_family"] = "Edge"
+        elif "opera" in ua_lower:
+            res["browser_family"] = "Opera"
+        # Device type: mobile?
+        if "mobile" in ua_lower:
+            res["device_type"] = "Mobile"
+        elif "tablet" in ua_lower:
+            res["device_type"] = "Tablet"
+        else:
+            res["device_type"] = "Desktop"
+        return res
+
+def extract_sec_ch_ua(request: Request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract Sec-CH-UA headers."""
+    return (
+        request.headers.get("sec-ch-ua"),
+        request.headers.get("sec-ch-ua-platform"),
+        request.headers.get("sec-ch-ua-mobile")
+    )
+
+def extract_device_info(request: Request) -> Dict[str, Any]:
+    """Gather all possible client/device info from the request."""
+    ua = request.headers.get("user-agent", "")
+    parsed_ua = parse_user_agent(ua)
+    sec_ch_ua, sec_ch_ua_platform, sec_ch_ua_mobile = extract_sec_ch_ua(request)
+
+    # Build full device info JSON
+    device_info = {
+        "user_agent": ua,
+        "parsed": parsed_ua,
+        "sec_ch_ua": sec_ch_ua,
+        "sec_ch_ua_platform": sec_ch_ua_platform,
+        "sec_ch_ua_mobile": sec_ch_ua_mobile,
+        "accept_language": request.headers.get("accept-language"),
+        "referer": request.headers.get("referer"),
+        "auth_username": extract_auth_username(request),
+        "method": request.method,
+        "path": request.url.path,
+        "query": str(request.url.query) if request.url.query else "",
+        "headers": dict(request.headers),
+    }
+    return device_info
+
+# ---------------------------------------------------------------------------
+# Minting canary token with retries
+# ---------------------------------------------------------------------------
 async def mint_canary(harvest_id: str, trap_type: str, retries: int = 3) -> Optional[Dict[str, Any]]:
     """
     Mint a fresh AWS Keys Canarytoken via canarytokens.org's free public API.
@@ -209,7 +409,7 @@ async def mint_canary(harvest_id: str, trap_type: str, retries: int = 3) -> Opti
         except Exception as e:
             log.error("mint_canary attempt %d/%d failed: %s", attempt, retries, e)
             if attempt < retries:
-                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                await asyncio.sleep(2 ** attempt)
                 continue
             return None
 
@@ -233,11 +433,15 @@ async def mint_canary(harvest_id: str, trap_type: str, retries: int = 3) -> Opti
 
     return None
 
+# ---------------------------------------------------------------------------
+# Core trap handler – now with full device capture
+# ---------------------------------------------------------------------------
 async def handle_trap(request: Request, trap_type: str) -> Dict[str, Any]:
     ip = get_client_ip(request)
     ua = request.headers.get("user-agent", "")
     now = time.time()
 
+    # Deduplicate per IP and trap type within window
     with db() as conn:
         cutoff = now - MINT_DEDUPE_HOURS * 3600
         existing = conn.execute(
@@ -255,6 +459,8 @@ async def handle_trap(request: Request, trap_type: str) -> Dict[str, Any]:
         }
 
     harvest_id = secrets.token_hex(8)
+
+    # Mint canary token
     minted = await mint_canary(harvest_id, trap_type)
     fallback_used = False
     if not minted:
@@ -266,25 +472,57 @@ async def handle_trap(request: Request, trap_type: str) -> Dict[str, Any]:
             "memo": f"tripwire:{trap_type}:{harvest_id[:8]}:MINT_FAILED",
         }
 
+    # Gather device info
+    device_info = extract_device_info(request)
+    parsed_ua = device_info["parsed"]
+
+    # Geo lookup
     geo = await geo_lookup(ip)
 
     with db() as conn:
         conn.execute(
             """INSERT INTO harvests
                (id, trap_type, visitor_ip, user_agent, headers_json, harvested_at,
-                canary_token_code, access_key_id, secret_access_key, memo, triggered, harvest_geo)
-               VALUES (?,?,?,?,?,?,?,?,?,?,0,?)""",
-            (harvest_id, trap_type, ip, ua, json.dumps(dict(request.headers)), now,
-             minted.get("token_code"), minted["access_key_id"], minted["secret_access_key"],
-             minted["memo"], geo),
+                canary_token_code, access_key_id, secret_access_key, memo, triggered, harvest_geo,
+                request_method, request_path, query_string, referer, accept_language,
+                auth_username, device_info_json, device_type, os_family, os_version,
+                browser_family, browser_version, platform,
+                sec_ch_ua, sec_ch_ua_platform, sec_ch_ua_mobile)
+               VALUES (?,?,?,?,?,?,?,?,?,?,0,?,
+                       ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                harvest_id, trap_type, ip, ua, json.dumps(dict(request.headers)), now,
+                minted["token_code"], minted["access_key_id"], minted["secret_access_key"],
+                minted["memo"], geo,
+                request.method,
+                request.url.path,
+                str(request.url.query) if request.url.query else "",
+                request.headers.get("referer"),
+                request.headers.get("accept-language"),
+                device_info.get("auth_username"),
+                json.dumps(device_info),
+                parsed_ua["device_type"],
+                parsed_ua["os_family"],
+                parsed_ua["os_version"],
+                parsed_ua["browser_family"],
+                parsed_ua["browser_version"],
+                parsed_ua["platform"],
+                device_info.get("sec_ch_ua"),
+                device_info.get("sec_ch_ua_platform"),
+                device_info.get("sec_ch_ua_mobile"),
+            )
         )
 
     warn = " ⚠️ MINT FAILED — fallback AWS example key served, not monitored" if fallback_used else ""
+    # Send Telegram alert with device info summary
+    device_summary = f"{parsed_ua['device_type']} | {parsed_ua['os_family']} {parsed_ua['os_version']} | {parsed_ua['browser_family']} {parsed_ua['browser_version']}"
     await notify_telegram(
         "🪤 <b>TRAP SPRUNG</b>\n"
         f"Type: {trap_type}\n"
         f"IP: {ip}\n"
         f"Geo: {geo}\n"
+        f"Device: {device_summary}\n"
+        f"Auth user: {device_info.get('auth_username') or 'none'}\n"
         f"UA: {ua[:150]}\n"
         f"Harvest ID: {harvest_id}{warn}"
     )
@@ -452,10 +690,14 @@ async def canary_webhook(request: Request):
         delta_min = (now - harvest_row["harvested_at"]) / 60
         harvest_time = datetime.fromtimestamp(harvest_row["harvested_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         trigger_time = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        # Include device info in alert
+        device_summary = f"{harvest_row['device_type']} | {harvest_row['os_family']} {harvest_row['os_version']} | {harvest_row['browser_family']} {harvest_row['browser_version']}"
         msg = (
             "🚨 <b>CANARY TRIGGERED — CORRELATED INCIDENT</b>\n"
             f"Trap: {harvest_row['trap_type']}\n"
             f"Harvested by: {harvest_row['visitor_ip']} ({harvest_row['harvest_geo']})\n"
+            f"Device: {device_summary}\n"
+            f"Auth user: {harvest_row['auth_username'] or 'none'}\n"
             f"Harvest time: {harvest_time}\n"
             f"Used from: {trigger_ip} ({geo})\n"
             f"Trigger time: {trigger_time}\n"
@@ -474,7 +716,7 @@ async def canary_webhook(request: Request):
     return {"status": "received"}
 
 # ---------------------------------------------------------------------------
-# Dashboard (HTML + JSON API) – top‑notch UI
+# Dashboard (HTML + JSON API) – now shows device details
 # ---------------------------------------------------------------------------
 def fmt_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -514,6 +756,13 @@ def build_console_data(limit: int = 300) -> Dict[str, Any]:
                     "trigger_time": t["trigger_time"],
                     "trigger_time_str": fmt_iso(t["trigger_time"]),
                     "delta_min": round(delta_min, 1),
+                    # device info
+                    "device_type": h["device_type"],
+                    "os_family": h["os_family"],
+                    "os_version": h["os_version"],
+                    "browser_family": h["browser_family"],
+                    "browser_version": h["browser_version"],
+                    "auth_username": h["auth_username"],
                 })
         else:
             outstanding.append({
@@ -523,6 +772,12 @@ def build_console_data(limit: int = 300) -> Dict[str, Any]:
                 "harvest_geo": h["harvest_geo"],
                 "harvest_time": h["harvested_at"],
                 "harvest_time_str": fmt_iso(h["harvested_at"]),
+                "device_type": h["device_type"],
+                "os_family": h["os_family"],
+                "os_version": h["os_version"],
+                "browser_family": h["browser_family"],
+                "browser_version": h["browser_version"],
+                "auth_username": h["auth_username"],
             })
 
     incidents.sort(key=lambda i: i["trigger_time"], reverse=True)
@@ -783,6 +1038,16 @@ async def dashboard(auth: bool = Depends(check_auth)):
       font-size: 11px;
       margin-top: 2px;
     }}
+    .node .device {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }}
+    .node .auth {{
+      color: var(--amber);
+      font-size: 11px;
+      margin-top: 2px;
+    }}
     .link {{
       flex: 0 0 auto;
       display: flex;
@@ -851,6 +1116,7 @@ async def dashboard(auth: bool = Depends(check_auth)):
     .out-row:hover {{ background: var(--panel-2); }}
     .out-row .ip {{ font-weight: 500; }}
     .out-row .geo {{ color: var(--muted); font-size: 12px; }}
+    .out-row .device {{ color: var(--muted); font-size: 11px; }}
     .out-row .time {{ color: var(--dim); font-size: 11px; }}
 
     .empty {{
@@ -912,7 +1178,7 @@ async def dashboard(auth: bool = Depends(check_auth)):
   </div>
 
   <div class="controls">
-    <input id="search" type="text" placeholder="Filter by IP, ASN, trap type, or harvest ID..." oninput="render()">
+    <input id="search" type="text" placeholder="Filter by IP, ASN, trap type, harvest ID, device, OS..." oninput="render()">
     <select id="trap-filter" onchange="render()">
       <option value="">All trap types</option>
       <option value="env_file">.env</option>
@@ -940,7 +1206,13 @@ function matches(item, q, trapFilter) {{
   if (trapFilter && item.trap_type !== trapFilter) return false;
   if (!q) return true;
   q = q.toLowerCase();
-  return Object.values(item).some(v => String(v ?? '').toLowerCase().includes(q));
+  // search in IP, geo, trap_type, harvest_id, device_type, os, browser, auth_username
+  const searchable = [
+    item.harvest_ip, item.harvest_geo, item.trap_type, item.harvest_id,
+    item.device_type, item.os_family, item.os_version, item.browser_family, item.browser_version,
+    item.auth_username
+  ];
+  return searchable.some(v => String(v ?? '').toLowerCase().includes(q));
 }}
 
 function render() {{
@@ -964,6 +1236,8 @@ function render() {{
             <div class="label">Harvested by</div>
             <div class="ip">${{esc(i.harvest_ip)}}</div>
             <div class="geo">${{esc(i.harvest_geo)}}</div>
+            <div class="device">${{esc(i.device_type)}} | ${{esc(i.os_family)}} ${{esc(i.os_version)}} | ${{esc(i.browser_family)}} ${{esc(i.browser_version)}}</div>
+            ${{i.auth_username ? `<div class="auth">Auth: ${{esc(i.auth_username)}}</div>` : ''}}
             <div class="time">${{esc(i.harvest_time_str)}} UTC</div>
           </div>
           <div class="link"><div class="line"></div>${{i.delta_min}} min later</div>
@@ -992,6 +1266,8 @@ function render() {{
         <span class="badge">${{esc(o.trap_type)}}</span>
         <span class="ip">${{esc(o.harvest_ip)}}</span>
         <span class="geo">${{esc(o.harvest_geo)}}</span>
+        <span class="device">${{esc(o.device_type)}} | ${{esc(o.os_family)}} ${{esc(o.os_version)}} | ${{esc(o.browser_family)}} ${{esc(o.browser_version)}}</span>
+        ${{o.auth_username ? `<span class="auth">Auth: ${{esc(o.auth_username)}}</span>` : ''}}
         <span class="time">${{esc(o.harvest_time_str)}} UTC</span>
         <span class="hid">${{esc(o.harvest_id)}}</span>
       </div>
@@ -1400,8 +1676,6 @@ VAULT_PAGE = """<!DOCTYPE html>
   </div>
 
 </div>
-
-<!-- Simple deception: if someone tries to click on the login button, it shows a message, but also we could log the attempt in the backend? Not necessary for this decoy. -->
 </body>
 </html>"""
 
